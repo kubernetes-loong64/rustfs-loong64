@@ -57,7 +57,7 @@ jobs:
         run: |
           sudo sed -i "s#deb.debian.org#mirrors.aliyun.com#" /etc/apt/sources.list.d/debian.sources
           sudo apt update
-          sudo apt install -y git make file rustup cargo
+          sudo apt install -y git make file rustup
       - name: Clone rustfs
         run: |
           git clone --branch ${{ env.RUSTFS_BRANCH }} --depth 1 https://github.com/rustfs/rustfs.git rustfs
