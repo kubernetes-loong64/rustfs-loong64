@@ -1,0 +1,479 @@
+diff --git a/.config/make/build.mak b/.config/make/build.mak
+index db3a38919..dbd5d1ed6 100644
+--- a/.config/make/build.mak
++++ b/.config/make/build.mak
+@@ -5,6 +5,11 @@ build: ## Build RustFS binary (includes console by default)
+ 	@echo "🔨 Building RustFS using build-rustfs.sh script..."
+ 	./build-rustfs.sh
+ 
++.PHONY: build-cli
++build-cli: ## Build only the rustfs-cli binary
++	@echo "🔨 Building rustfs-cli using build-rustfs.sh script..."
++	./build-rustfs.sh -b rustfs-cli --no-console
++
+ .PHONY: build-dev
+ build-dev: ## Build RustFS in Development mode
+ 	@echo "🔨 Building RustFS in development mode..."
+@@ -34,6 +39,12 @@ build-gnu-arm64: ## Build aarch64 GNU version
+ 	@echo "💡 On macOS/Windows, use 'make build-docker' or 'make docker-dev' instead"
+ 	./build-rustfs.sh --platform aarch64-unknown-linux-gnu
+ 
++.PHONY: build-musl-loongarch64
++build-musl-loongarch64: ## Build statically linked loongarch64 musl version (run on LoongArch)
++	@echo "🔨 Building rustfs and rustfs-cli for loongarch64-unknown-linux-musl (static)..."
++	@echo "💡 Run this on a loongarch64 Linux host, then check with 'ldd target/release/loongarch64-unknown-linux-musl/rustfs'"
++	./build-rustfs.sh --platform loongarch64-unknown-linux-musl --static --all-bins
++
+ 
+ ## —— Profiling build (dial9 Tokio runtime telemetry) ------------------------------------------
+ 
+diff --git a/build-rustfs.sh b/build-rustfs.sh
+index 70de9b4ec..4f74b7b86 100755
+--- a/build-rustfs.sh
++++ b/build-rustfs.sh
+@@ -102,8 +102,16 @@ generate_sha256() {
+ OUTPUT_DIR="target/release"
+ PLATFORM=$(detect_platform)  # Auto-detect current platform
+ BINARY_NAME="rustfs"
++BINARY_NAME_EXPLICIT=false
++# Binaries `cargo build -p rustfs --bins` produces: every `[[bin]]` in
++# rustfs/Cargo.toml whose required-features are satisfied by a default build
++# (rustfs-cli-e2e stays out because it needs offline-enrollment-e2e-root).
++# Keep in sync with the manifest.
++PACKAGE_BINARIES=(rustfs rustfs-cli)
++ALL_BINS=false
+ BUILD_TYPE="release"
+ SIGN=false
++STATIC=false
+ WITH_CONSOLE=true
+ FORCE_CONSOLE_UPDATE=false
+ CONSOLE_VERSION="latest"
+@@ -123,6 +131,7 @@ usage() {
+     echo "Options:"
+     echo "  -o, --output-dir DIR       Output directory (default: target/release)"
+     echo "  -b, --binary-name NAME     Binary name (default: rustfs)"
++    echo "  --all-bins                 Build and deliver every RustFS binary in one cargo invocation"
+     echo "  -p, --platform TARGET      Target platform (default: auto-detect)"
+     echo "                              Supported platforms:"
+     echo "                                x86_64-unknown-linux-gnu"
+@@ -137,6 +146,7 @@ usage() {
+     echo "                                x86_64-pc-windows-msvc"
+     echo "                                aarch64-pc-windows-msvc"
+     echo "  --dev                      Build in dev mode"
++    echo "  --static                   Link the binary fully statically (no libc dependency)"
+     echo "  --sign                     Sign binaries after build"
+     echo "  --with-console             Download console static assets (default)"
+     echo "  --no-console               Skip console static assets"
+@@ -149,6 +159,8 @@ usage() {
+     echo "Examples:"
+     echo "  $0                         # Build for current platform (includes console assets)"
+     echo "  $0 --dev                   # Development build"
++    echo "  $0 --all-bins              # Build rustfs and rustfs-cli together"
++    echo "  $0 --static --platform x86_64-unknown-linux-musl  # Self-contained Linux binary"
+     echo "  $0 --sign                  # Build and sign binary (release CI)"
+     echo "  $0 --features webdav       # Build with WebDAV support"
+     echo "  $0 --features full         # Build with all protocol features"
+@@ -214,10 +226,18 @@ setup_rust_environment() {
+     print_message $YELLOW "Installing target: $PLATFORM"
+     rustup target add "$PLATFORM"
+ 
++    # `--static` keeps the C runtime inside the binary. musl normally links it
++    # statically anyway, but the dynamic CRT is what keeps the Alpine runtime
++    # image small, so the default stays as it was.
++    if [ "$STATIC" = "true" ]; then
++        export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
++    elif [[ "$PLATFORM" == *"musl"* ]]; then
++        export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=-crt-static"
++    fi
++
+     # Set up environment variables for musl targets
+     if [[ "$PLATFORM" == *"musl"* ]]; then
+         print_message $YELLOW "Setting up environment for musl target..."
+-        export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=-crt-static"
+ 
+         # For cargo-zigbuild, set up additional environment variables
+         if command -v cargo-zigbuild &> /dev/null; then
+@@ -391,14 +411,15 @@ verify_binary() {
+ # Build binary for current platform
+ build_binary() {
+     local version=$(get_version)
+-    local output_file="${OUTPUT_DIR}/${PLATFORM}/${BINARY_NAME}"
++    local output_dir="${OUTPUT_DIR}/${PLATFORM}"
+ 
+     print_message $BLUE "🏗️  Building for platform: $PLATFORM"
+     print_message $YELLOW "   Version: $version"
+-    print_message $YELLOW "   Output: $output_file"
++    print_message $YELLOW "   Binaries: ${BINARIES_TO_BUILD[*]}"
++    print_message $YELLOW "   Output: $output_dir"
+ 
+     # Create output directory
+-    mkdir -p "${OUTPUT_DIR}/${PLATFORM}"
++    mkdir -p "$output_dir"
+ 
+     # Simple build logic matching the working version (4fb4b353)
+     # Force rebuild by touching build.rs
+@@ -410,8 +431,10 @@ build_binary() {
+ 
+     print_message $BLUE "📦 Using working version build logic..."
+ 
+-    # Check if we need cross-compilation
+-    if [ "$PLATFORM" != "$current_platform" ]; then
++    # Check if we need cross-compilation. Swapping the libc of the host's own
++    # triple (gnu -> musl on the same architecture) is not cross-compilation:
++    # rust-std ships the self-contained musl CRT, so the host toolchain links it.
++    if [ "$PLATFORM" != "$current_platform" ] && [ "$PLATFORM" != "${current_platform%-*}-musl" ]; then
+         # Cross-compilation needed
+         if [[ "$PLATFORM" == *"apple-darwin"* ]]; then
+             print_message $RED "❌ macOS cross-compilation not supported"
+@@ -433,8 +456,13 @@ build_binary() {
+             build_cmd="cargo zigbuild"
+         fi
+     else
+-        # Native compilation
+-        build_cmd="RUSTFLAGS='${RUSTFLAGS:+$RUSTFLAGS }-Clink-arg=-lm' cargo build"
++        # Native compilation. -lm is only needed against glibc: musl folds the
++        # math library into libc and its self-contained CRT has no libm.a.
++        local native_link_args="-Clink-arg=-lm"
++        if [[ "$PLATFORM" == *"musl"* ]]; then
++            native_link_args=""
++        fi
++        build_cmd="RUSTFLAGS='${RUSTFLAGS:+$RUSTFLAGS }${native_link_args}' cargo build"
+     fi
+ 
+     if [ "$BUILD_TYPE" = "release" ]; then
+@@ -442,7 +470,15 @@ build_binary() {
+     fi
+ 
+     build_cmd+=" --target $PLATFORM"
+-    build_cmd+=" -p rustfs --bins"
++    if [ "$ALL_BINS" = "true" ]; then
++        build_cmd+=" -p rustfs --bins"
++    else
++        # Name the single requested binary: `--bins` would also link the server
++        # binary when a caller only needs rustfs-cli.
++        local quoted_binary
++        printf -v quoted_binary '%q' "$BINARY_NAME"
++        build_cmd+=" -p rustfs --bin $quoted_binary"
++    fi
+ 
+     if [ -n "$FEATURES" ]; then
+         local quoted_features
+@@ -456,22 +492,25 @@ build_binary() {
+     if eval $build_cmd; then
+         print_message $GREEN "✅ Successfully built for $PLATFORM"
+ 
+-        # Copy binary to output directory
+-        cp "target/${PLATFORM}/${BUILD_TYPE}/${BINARY_NAME}" "$output_file"
+-
+         # Generate checksums
+         print_message $BLUE "🔐 Generating checksums..."
+-        (cd "${OUTPUT_DIR}/${PLATFORM}" && generate_sha256 "${BINARY_NAME}" "${BINARY_NAME}.sha256sum")
++        for binary in "${BINARIES_TO_BUILD[@]}"; do
++            # Copy binary to output directory
++            cp "target/${PLATFORM}/${BUILD_TYPE}/${binary}" "$output_dir/${binary}"
++            (cd "$output_dir" && generate_sha256 "${binary}" "${binary}.sha256sum")
++        done
+ 
+         # Verify binary functionality (if not skipped)
+         if [ "$SKIP_VERIFICATION" = false ]; then
+             print_message $BLUE "🔍 Verifying binary functionality..."
+-            if verify_binary "$output_file"; then
+-                print_message $GREEN "✅ Binary verification passed"
+-            else
+-                print_message $RED "❌ Binary verification failed"
+-                return 1
+-            fi
++            for binary in "${BINARIES_TO_BUILD[@]}"; do
++                if verify_binary "$output_dir/${binary}"; then
++                    print_message $GREEN "✅ Binary verification passed"
++                else
++                    print_message $RED "❌ Binary verification failed"
++                    return 1
++                fi
++            done
+         else
+             print_message $YELLOW "⚠️  Binary verification skipped by user request"
+         fi
+@@ -479,7 +518,9 @@ build_binary() {
+         # Sign binary if requested
+         if [ "$SIGN" = true ]; then
+             print_message $BLUE "✍️  Signing binary..."
+-            (cd "${OUTPUT_DIR}/${PLATFORM}" && minisign -S -m "${BINARY_NAME}" -s ~/.minisign/minisign.key)
++            for binary in "${BINARIES_TO_BUILD[@]}"; do
++                (cd "$output_dir" && minisign -S -m "${binary}" -s ~/.minisign/minisign.key)
++            done
+         fi
+ 
+         print_message $GREEN "✅ Build completed successfully"
+@@ -500,7 +541,9 @@ build_rustfs() {
+     print_message $YELLOW "   Platform: $PLATFORM"
+     print_message $YELLOW "   Output Directory: $OUTPUT_DIR"
+     print_message $YELLOW "   Build Type: $BUILD_TYPE"
++    print_message $YELLOW "   Binaries: ${BINARIES_TO_BUILD[*]}"
+     print_message $YELLOW "   Sign: $SIGN"
++    print_message $YELLOW "   Static: $STATIC"
+     print_message $YELLOW "   With Console: $WITH_CONSOLE"
+     if [ "$WITH_CONSOLE" = true ]; then
+         print_message $YELLOW "   Console Version: $CONSOLE_VERSION"
+@@ -527,11 +570,13 @@ build_rustfs() {
+     print_message $GREEN "🎉 Build process completed successfully!"
+ 
+     # Show built binary
+-    local binary_file="${OUTPUT_DIR}/${PLATFORM}/${BINARY_NAME}"
+-    if [ -f "$binary_file" ]; then
+-        local size=$(ls -lh "$binary_file" | awk '{print $5}')
+-        print_message $BLUE "📋 Built binary: $binary_file ($size)"
+-    fi
++    for binary in "${BINARIES_TO_BUILD[@]}"; do
++        local binary_file="${OUTPUT_DIR}/${PLATFORM}/${binary}"
++        if [ -f "$binary_file" ]; then
++            local size=$(ls -lh "$binary_file" | awk '{print $5}')
++            print_message $BLUE "📋 Built binary: $binary_file ($size)"
++        fi
++    done
+ }
+ 
+ # Parse command line arguments
+@@ -543,8 +588,13 @@ while [[ $# -gt 0 ]]; do
+             ;;
+         -b|--binary-name)
+             BINARY_NAME="$2"
++            BINARY_NAME_EXPLICIT=true
+             shift 2
+             ;;
++        --all-bins)
++            ALL_BINS=true
++            shift
++            ;;
+         -p|--platform)
+             CUSTOM_PLATFORM="$2"
+             shift 2
+@@ -553,6 +603,10 @@ while [[ $# -gt 0 ]]; do
+             BUILD_TYPE="debug"
+             shift
+             ;;
++        --static)
++            STATIC=true
++            shift
++            ;;
+         --sign)
+             SIGN=true
+             shift
+@@ -599,6 +653,18 @@ while [[ $# -gt 0 ]]; do
+     esac
+ done
+ 
++if [ "$ALL_BINS" = "true" ] && [ "$BINARY_NAME_EXPLICIT" = "true" ]; then
++    print_message $RED "❌ --all-bins cannot be combined with --binary-name"
++    exit 1
++fi
++
++# Resolve the binaries to build and deliver once every flag is known. One
++# cargo invocation keeps the shared rustfs crate compiled a single time.
++BINARIES_TO_BUILD=("$BINARY_NAME")
++if [ "$ALL_BINS" = "true" ]; then
++    BINARIES_TO_BUILD=("${PACKAGE_BINARIES[@]}")
++fi
++
+ # Main execution
+ main() {
+     print_message $BLUE "🦀 RustFS Binary Build Script"
+@@ -615,8 +681,12 @@ main() {
+         PLATFORM="$CUSTOM_PLATFORM"
+         print_message $YELLOW "🎯 Using specified platform: $PLATFORM"
+ 
+-        # Auto-enable skip verification for cross-compilation
+-        if [ "$PLATFORM" != "$(detect_platform)" ]; then
++        # Auto-enable skip verification for cross-compilation. Swapping the
++        # host's own libc (gnu -> musl) still runs on this machine, so it stays
++        # verifiable, matching the native branch in build_binary.
++        local host_platform
++        host_platform=$(detect_platform)
++        if [ "$PLATFORM" != "$host_platform" ] && [ "$PLATFORM" != "${host_platform%-*}-musl" ]; then
+             SKIP_VERIFICATION=true
+             print_message $YELLOW "⚠️  Cross-compilation detected, enabling --skip-verification"
+         fi
+diff --git a/scripts/test_build_rustfs_options.sh b/scripts/test_build_rustfs_options.sh
+index aef5baf22..84eb3fe29 100755
+--- a/scripts/test_build_rustfs_options.sh
++++ b/scripts/test_build_rustfs_options.sh
+@@ -33,6 +33,25 @@ case "$1" in
+ esac
+ STUB
+ 
++cat >"$BIN_DIR/uname" <<'STUB'
++#!/usr/bin/env bash
++case "$1" in
++  -m)
++    if [[ -n "${FAKE_UNAME_MACHINE:-}" ]]; then
++      echo "$FAKE_UNAME_MACHINE"
++      exit 0
++    fi
++    ;;
++  -s)
++    if [[ -n "${FAKE_UNAME_SYSTEM:-}" ]]; then
++      echo "$FAKE_UNAME_SYSTEM"
++      exit 0
++    fi
++    ;;
++esac
++exec /usr/bin/uname "$@"
++STUB
++
+ cat >"$BIN_DIR/cargo" <<'STUB'
+ #!/usr/bin/env bash
+ set -euo pipefail
+@@ -52,10 +71,18 @@ fi
+ target=""
+ profile="debug"
+ prev=""
++all_bins=false
++bin_name="rustfs"
+ for arg in "$@"; do
+   if [[ "$prev" == "--target" ]]; then
+     target="$arg"
+   fi
++  if [[ "$prev" == "--bin" ]]; then
++    bin_name="$arg"
++  fi
++  if [[ "$arg" == "--bins" ]]; then
++    all_bins=true
++  fi
+   if [[ "$arg" == "--release" ]]; then
+     profile="release"
+   fi
+@@ -64,12 +91,18 @@ done
+ 
+ if [[ -n "$target" ]]; then
+   mkdir -p "target/$target/$profile"
+-  printf '#!/usr/bin/env bash\nexit 0\n' >"target/$target/$profile/rustfs"
+-  chmod +x "target/$target/$profile/rustfs"
++  bin_names=("$bin_name")
++  if [[ "$all_bins" == "true" ]]; then
++    bin_names=(rustfs rustfs-cli)
++  fi
++  for name in "${bin_names[@]}"; do
++    printf '#!/usr/bin/env bash\nexit 0\n' >"target/$target/$profile/$name"
++    chmod +x "target/$target/$profile/$name"
++  done
+ fi
+ STUB
+ 
+-chmod +x "$BIN_DIR/rustup" "$BIN_DIR/git" "$BIN_DIR/cargo"
++chmod +x "$BIN_DIR/rustup" "$BIN_DIR/git" "$BIN_DIR/uname" "$BIN_DIR/cargo"
+ 
+ run_log="$TMP_DIR/run.log"
+ cargo_log="$TMP_DIR/cargo.log"
+@@ -106,6 +139,112 @@ short_cargo_log="$TMP_DIR/cargo-short.log"
+ grep -q -- "Features: full" "$short_run_log"
+ grep -q -- "--features full" "$short_cargo_log"
+ 
++cli_run_log="$TMP_DIR/run-cli.log"
++cli_cargo_log="$TMP_DIR/cargo-cli.log"
++(
++  cd "$PROJECT_DIR"
++  PATH="$BIN_DIR:$PATH" CARGO_LOG="$cli_cargo_log" ./build-rustfs.sh \
++    --dev \
++    --no-console \
++    --skip-verification \
++    --output-dir "$TMP_DIR/out-cli" \
++    -b rustfs-cli >"$cli_run_log"
++)
++
++grep -q -- "--bin rustfs-cli" "$cli_cargo_log"
++if grep -q -- "--bins" "$cli_cargo_log"; then
++  echo "Expected a binary-scoped build to avoid --bins" >&2
++  exit 1
++fi
++if ! compgen -G "$TMP_DIR/out-cli/*/rustfs-cli" >/dev/null; then
++  echo "Expected rustfs-cli in the output directory" >&2
++  exit 1
++fi
++
++loong_run_log="$TMP_DIR/run-loong.log"
++loong_cargo_log="$TMP_DIR/cargo-loong.log"
++loong_rustflags_log="$TMP_DIR/rustflags-loong.log"
++(
++  cd "$PROJECT_DIR"
++  PATH="$BIN_DIR:$PATH" \
++    FAKE_UNAME_MACHINE=loongarch64 \
++    FAKE_UNAME_SYSTEM=Linux \
++    CARGO_LOG="$loong_cargo_log" \
++    RUSTFLAGS_LOG="$loong_rustflags_log" \
++    ./build-rustfs.sh \
++    --dev \
++    --no-console \
++    --skip-verification \
++    --output-dir "$TMP_DIR/out-loong" \
++    --platform loongarch64-unknown-linux-musl \
++    --static >"$loong_run_log"
++)
++
++grep -q -- "Platform: loongarch64-unknown-linux-musl" "$loong_run_log"
++grep -q -- "--target loongarch64-unknown-linux-musl" "$loong_cargo_log"
++if grep -q -- "zigbuild" "$loong_cargo_log"; then
++  echo "A same-architecture musl build must not be treated as cross-compilation" >&2
++  exit 1
++fi
++grep -q -- "target-feature=+crt-static" "$loong_rustflags_log"
++if grep -q -- "target-feature=-crt-static" "$loong_rustflags_log"; then
++  echo "A static build must not disable crt-static" >&2
++  exit 1
++fi
++if grep -q -- "link-arg=-lm" "$loong_rustflags_log"; then
++  echo "A musl build must not link against a separate libm" >&2
++  exit 1
++fi
++if ! compgen -G "$TMP_DIR/out-loong/*/rustfs" >/dev/null; then
++  echo "Expected rustfs in the loongarch64 output directory" >&2
++  exit 1
++fi
++
++all_run_log="$TMP_DIR/run-all.log"
++all_cargo_log="$TMP_DIR/cargo-all.log"
++(
++  cd "$PROJECT_DIR"
++  PATH="$BIN_DIR:$PATH" CARGO_LOG="$all_cargo_log" ./build-rustfs.sh \
++    --dev \
++    --no-console \
++    --skip-verification \
++    --output-dir "$TMP_DIR/out-all" \
++    --all-bins >"$all_run_log"
++)
++
++grep -q -- "--bins" "$all_cargo_log"
++if grep -q -- "--bin " "$all_cargo_log"; then
++  echo "Expected --all-bins to build every bin in one cargo invocation" >&2
++  exit 1
++fi
++if [[ "$(awk 'END { print NR }' "$all_cargo_log")" != "1" ]]; then
++  echo "Expected --all-bins to run cargo exactly once" >&2
++  exit 1
++fi
++for binary in rustfs rustfs-cli; do
++  if ! compgen -G "$TMP_DIR/out-all/*/$binary" >/dev/null; then
++    echo "Expected $binary in the --all-bins output directory" >&2
++    exit 1
++  fi
++  if ! compgen -G "$TMP_DIR/out-all/*/$binary.sha256sum" >/dev/null; then
++    echo "Expected a checksum for $binary" >&2
++    exit 1
++  fi
++done
++
++all_conflict_log="$TMP_DIR/all-bins-conflict.log"
++if (
++  cd "$PROJECT_DIR"
++  PATH="$BIN_DIR:$PATH" CARGO_LOG="$all_cargo_log" ./build-rustfs.sh \
++    --all-bins \
++    -b rustfs-cli >"$all_conflict_log" 2>&1
++); then
++  echo "Expected --all-bins with --binary-name to fail" >&2
++  exit 1
++fi
++
++grep -q -- "--all-bins cannot be combined with --binary-name" "$all_conflict_log"
++
+ multi_run_log="$TMP_DIR/run-multi.log"
+ multi_cargo_log="$TMP_DIR/cargo-multi.log"
+ multi_arg_log="$TMP_DIR/cargo-multi-args.log"

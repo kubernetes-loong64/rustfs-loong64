@@ -73,15 +73,12 @@ jobs:
           git clone --branch ${{ env.RUSTFS_BRANCH }} --depth 1 https://github.com/rustfs/rustfs.git rustfs
       - name: ls
         run: ls -lah
+      - name: Apply loongarch64 build patch
+        working-directory: rustfs
+        run: git apply ../loongarch64.diff
       - name: Build rustfs
         working-directory: rustfs
-        run: make build
-      - name: Apply rustfs-cli build patch
-        working-directory: rustfs
-        run: git apply ../cli.diff
-      - name: Build rustfs-cli
-        working-directory: rustfs
-        run: make build-cli
+        run: make build-musl-loongarch64
       - name: Upload binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
