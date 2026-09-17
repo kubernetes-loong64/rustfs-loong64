@@ -24,7 +24,7 @@ jobs:
           else
             echo ${{ github.ref_name }}
           fi
-      - name: Extract containerd branch
+      - name: Extract rustfs branch
         id: extract
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -37,10 +37,10 @@ jobs:
           echo "RAW_VERSION=$RAW_VERSION"
           echo "RAW_VERSION=$RAW_VERSION" >> ${GITHUB_ENV}
           echo "RAW_VERSION=$RAW_VERSION" >> ${GITHUB_OUTPUT}
-          CONTAINERD_BRANCH=$(echo $RAW_VERSION | awk -F'+' '{print $1}')
-          echo "CONTAINERD_BRANCH=$CONTAINERD_BRANCH"
-          echo "CONTAINERD_BRANCH=$CONTAINERD_BRANCH" >> ${GITHUB_ENV}
-          echo "CONTAINERD_BRANCH=$CONTAINERD_BRANCH" >> ${GITHUB_OUTPUT}
+          RUSTFS_BRANCH=$(echo $RAW_VERSION | awk -F'+' '{print $1}')
+          echo "RUSTFS_BRANCH=$RUSTFS_BRANCH"
+          echo "RUSTFS_BRANCH=$RUSTFS_BRANCH" >> ${GITHUB_ENV}
+          echo "RUSTFS_BRANCH=$RUSTFS_BRANCH" >> ${GITHUB_OUTPUT}
           RELEASE=$(echo $RAW_VERSION | awk -F'+' '{print $2}')
           RELEASE=${RELEASE:-alpha.${{ github.run_number }}}
           echo "RELEASE=$RELEASE"
@@ -57,4 +57,12 @@ jobs:
         run: |
           sudo sed -i "s#deb.debian.org#mirrors.aliyun.com#" /etc/apt/sources.list.d/debian.sources
           sudo apt update
-          sudo apt install -y git make file
+          sudo apt install -y git make file rustup
+      - name: Clone rustfs
+        run: |
+          git clone --branch ${{ env.RUSTFS_BRANCH }} --depth 1 https://github.com/rustfs/rustfs.git rustfs
+      - name: ls
+        run: ls -lah
+      - name: Build rustfs
+        working-directory: rustfs
+        run: make build
