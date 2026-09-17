@@ -55,5 +55,5 @@ jobs:
           echo "IS_STABLE=$IS_STABLE" >> ${GITHUB_OUTPUT}
       - name: Install build tools
         run: |
-          apt update
-          apt install -y git make file
+          sudo apt update
+          sudo apt install -y git make file
