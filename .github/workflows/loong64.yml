@@ -81,4 +81,4 @@ jobs:
         with:
           name: rustfs-loong64-binaries-${{ env.RUSTFS_BRANCH }}-build-${{ github.run_number }}
           path: |
-            rustfs/target/release/loongarch64-unknown-linux-gnu/rustfs
+            rustfs/target/release/loongarch64-unknown-linux-gnu
